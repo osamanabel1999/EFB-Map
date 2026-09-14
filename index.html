@@ -48,6 +48,136 @@
         const STYLE_SAT = 'mapbox://styles/mapbox/satellite-v9';
         const OWM_API_KEY = 'd2b9c49baa0f1dac5a0dada3a4c94cc1';
 
+        // ============================================================
+        // EFB RUNTIME OVERLAY PROTECTION
+        // ============================================================
+        // Flutter owns the operational aviation overlays.  This HTML page
+        // must never recolor them or let the base style's lighting/fog make
+        // them appear black/dim when switching DARK <-> SATELLITE.
+        const EFB_RUNTIME_LINE_LAYERS = [
+            'efb-flight-path-casing-v3',
+            'efb-flight-path-layer-v3',
+            'efb-airways-overlay-layer',
+            'efb-segments-line-layer',
+            'efb-fir-line-layer',
+            'efb-oceanic-line-layer',
+            'efb-oceanic-hit-layer'
+        ];
+
+        const EFB_RUNTIME_FILL_LAYERS = [
+            'efb-fir-fill-layer',
+            'efb-segments-fill-layer'
+        ];
+
+        const EFB_RUNTIME_CIRCLE_LAYERS = [
+            'efb-airways-endpoint-layer',
+            'efb-oceanic-endpoint-layer',
+            'efb-pireps-layer',
+            'efb-aurora-low-layer',
+            'efb-aurora-mid-layer',
+            'efb-aurora-high-layer',
+            'efb-aurora-glow-layer'
+        ];
+
+        const EFB_RUNTIME_SYMBOL_LAYERS = [
+            'efb-planes-layer',
+            'efb-airports-layer',
+            'efb-navaids-layer',
+            'efb-waypoints-layer',
+            'efb-airways-name-layer',
+            'efb-airways-alt-layer',
+            'efb-fir-label-layer',
+            'efb-segments-label-layer',
+            'efb-oceanic-label-layer',
+            'efb-pireps-label-layer'
+        ];
+
+        function applyEfbBaseStyleEnvironment() {
+            try {
+                if (state.mapStyle === 'SATELLITE') {
+                    // Satellite-v9 is an imagery base. Do not apply the dark
+                    // atmospheric fog used by the dark aviation style.
+                    map.setFog(null);
+                } else {
+                    map.setFog({
+                        'color': 'rgb(4, 10, 24)',
+                        'high-color': 'rgb(36, 92, 223)',
+                        'horizon-blend': 0.1,
+                        'space-color': 'rgb(2, 4, 10)',
+                        'star-intensity': 0.7
+                    });
+                }
+            } catch (e) {}
+        }
+
+        function applyEfbRuntimeLighting() {
+            if (!map || !map.isStyleLoaded()) return;
+
+            // Mapbox GL JS 3.x can apply style lighting to custom layers.
+            // Emissive strength 1 makes Flutter-owned overlays retain their
+            // authored colors instead of becoming darkened by the basemap.
+            EFB_RUNTIME_LINE_LAYERS.forEach(function(id) {
+                try {
+                    if (map.getLayer(id)) {
+                        map.setPaintProperty(id, 'line-emissive-strength', 1);
+                    }
+                } catch (e) {}
+            });
+
+            EFB_RUNTIME_FILL_LAYERS.forEach(function(id) {
+                try {
+                    if (map.getLayer(id)) {
+                        map.setPaintProperty(id, 'fill-emissive-strength', 1);
+                    }
+                } catch (e) {}
+            });
+
+            EFB_RUNTIME_CIRCLE_LAYERS.forEach(function(id) {
+                try {
+                    if (map.getLayer(id)) {
+                        map.setPaintProperty(id, 'circle-emissive-strength', 1);
+                    }
+                } catch (e) {}
+            });
+
+            EFB_RUNTIME_SYMBOL_LAYERS.forEach(function(id) {
+                try {
+                    if (map.getLayer(id)) {
+                        map.setPaintProperty(id, 'text-emissive-strength', 1);
+                    }
+                } catch (e) {}
+                try {
+                    if (map.getLayer(id)) {
+                        map.setPaintProperty(id, 'icon-emissive-strength', 1);
+                    }
+                } catch (e) {}
+            });
+
+            // The Flutter bridge already owns the exact operational colors.
+            // Re-apply them after the new base style and after Flutter has
+            // rebuilt its runtime layers.
+            try {
+                if (typeof window.forceEfbOperationalLayerColors === 'function') {
+                    window.forceEfbOperationalLayerColors();
+                }
+            } catch (e) {}
+        }
+
+        function stabilizeEfbRuntimeOverlays() {
+            // Style replacement + WebView/Flutter injection can finish on
+            // different ticks. Apply on several short ticks so no base-style
+            // operation can leave the Flutter overlays in a stale visual state.
+            const delays = [0, 60, 180, 400, 800];
+            delays.forEach(function(delay) {
+                setTimeout(function() {
+                    try {
+                        applyEfbBaseStyleEnvironment();
+                        applyEfbRuntimeLighting();
+                    } catch (e) {}
+                }, delay);
+            });
+        }
+
         // متغيرات البيانات
         let rawAirports = [];
         let planesGeoJSON = { type: 'FeatureCollection', features: [] };
@@ -78,9 +208,11 @@
         window.setMapState = function(key, value) {
             state[key] = value;
             if (key === 'mapStyle') {
+                // The persistent style.load handler owns layer
+                // re-initialization. Avoid a second initLayers callback here,
+                // which can race Flutter's runtime-layer rehydration.
                 map.setStyle(value === 'SATELLITE' ? STYLE_SAT : STYLE_DARK);
-                // إعادة تحميل الطبقات بعد تغيير الستايل
-                map.once('style.load', initLayers);
+                stabilizeEfbRuntimeOverlays();
             } else if (key === 'weather') {
                 updateWeather();
             } else if (key === 'flightPath' || key === 'depIcao' || key === 'arrIcao') {
@@ -119,14 +251,10 @@
         // ==========================================
         
         map.on('style.load', () => {
-            map.setFog({
-                'color': 'rgb(4, 10, 24)',
-                'high-color': 'rgb(36, 92, 223)',
-                'horizon-blend': 0.1,
-                'space-color': 'rgb(2, 4, 10)',
-                'star-intensity': 0.7
-            });
-            
+            // Keep the base environment appropriate to the selected style.
+            // Never carry the dark atmospheric fog into Satellite.
+            applyEfbBaseStyleEnvironment();
+
             // تحميل أيقونة الطائرة الأصلية
             map.loadImage('https://upload.wikimedia.org/wikipedia/commons/1/17/Airplane_silhouette_orange.svg', (error, image) => {
                 if (error) throw error;
@@ -134,6 +262,7 @@
                 initLayers();
                 fetchAirports();
                 fetchPlanes();
+                stabilizeEfbRuntimeOverlays();
             });
         });
 
@@ -378,7 +507,10 @@
             map.setLayoutProperty('airports-circle', 'visibility', (state.airports || state.flightPath) ? 'visible' : 'none');
             map.setLayoutProperty('airports-label', 'visibility', (state.airports || state.flightPath) ? 'visible' : 'none');
             
-            map.setLayoutProperty('flight-path-layer', 'visibility', state.flightPath ? 'visible' : 'none');
+            // Flutter owns the operational Flight Path. Keep the legacy
+            // HTML compatibility layer hidden so it can never compete with
+            // the Flutter-colored layer after a style switch.
+            map.setLayoutProperty('flight-path-layer', 'visibility', 'none');
             
             map.setLayoutProperty('planes-callsign', 'visibility', (state.callsigns && !state.radar) ? 'visible' : 'none');
             map.setLayoutProperty('planes-radar', 'visibility', state.radar ? 'visible' : 'none');
